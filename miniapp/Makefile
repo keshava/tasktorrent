@@ -32,9 +32,6 @@ OBJ  = $(OBJDIR)/communications.o $(OBJDIR)/serialization.o $(OBJDIR)/util.o
 $(OBJDIR)/%.o: $(SRCDIR)/%.cpp $(DEPS)
 	$(CC) -o $@ -c $< $(CFLAGS) $(INCLUDE)
 
-snchol: snchol.cpp $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(INCLUDE) $(LIBS) $(LDFLAGS)
-
 snchol_2d: snchol_2d.cpp $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(INCLUDE) $(LIBS) $(LDFLAGS)
 

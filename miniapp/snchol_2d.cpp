@@ -124,6 +124,12 @@ struct Bloc
     // Accumulation debugging
     atomic<bool> accumulating_busy;
     atomic<int> accumulated;
+
+    // Solutions
+    mutex xsol_mtx;             // Protect accumulations into xsol. This avoid an extra annoying TF
+    VectorXd xsol;              // Solution on this node. 
+                                // For diagonal bloc A[i,i] -> the solution x[i]
+                                // For off-diagonal bloc A[i,j] -> the partial x[i] to be accumulated into x[i] eventually
     
     Bloc() : matA(nullptr), n_accumulate(0), accumulating_busy(false), accumulated(0){};
     MatrixXd *A() { return matA.get(); }
@@ -138,13 +144,16 @@ struct Bloc
 struct Node
 {
     // Node data
-    int start;            // Global row/col
-    int size;             // Global row/col
-    int end;              // Global row/col
-    vector<int> nbrs;     // Global node id
-    vector<int> children; // Global node id
+    int start;             // Global row/col
+    int size;              // Global row/col
+    int end;               // Global row/col
+    vector<int> nbrs;      // Global node id
+    vector<int> ancestors; // Global node id
+
+    // Ordering
+    vector<int> children; // Global node id    
     int parent;           // Global node id
-    VectorXd xsol;        // Solution on this node
+
     Node(int s_, int l_) : start(s_), size(l_) {
         end = start + size;
     };
@@ -167,9 +176,10 @@ struct DistMat
     int ij2rank(int2 ij)
     {
         int i = ij[0];
-        int j = ij[1];
+        int j = ij[1];        
         assert(i < nblk && i >= 0);
         assert(j < nblk && j >= 0);
+        assert(i >= j);
         return i % prows + prows * (j % pcols);
     }
 
@@ -318,7 +328,10 @@ struct DistMat
                     b->allocate();
                 }
             }
-            // Add to parent
+            // Add to parent & before
+            for(auto nb: n->nbrs) {
+                nodes.at(nb)->ancestors.push_back(k);
+            }
             if (n->nbrs.size() > 0)
             {
                 assert(n->nbrs.at(0) > k);
@@ -339,7 +352,6 @@ struct DistMat
                 n->parent = -1;
             }
         }
-        printf("[%d] Done allocating matrix\n", comm_rank());
         // Fill with A
         for (int k = 0; k < nblk; k++)
         {
@@ -522,7 +534,7 @@ struct DistMat
             assert(blocs.at({i,j})->accumulating_busy.load());
             blocs.at({i,j})->accumulating_busy.store(false);
         }
-    }
+    }    
 
     void factorize(int n_threads)
     {
@@ -770,50 +782,50 @@ struct DistMat
         printf("[%d] Scat %3.2e s., %3.2e s./thread\n", comm_rank(), double(scat_us / 1e6), double(scat_us / 1e6) / n_threads);
         printf(">>>>%d,%d,%d,%3.2e\n", comm_rank(), comm_size(), n_threads, elapsed(t0, t1));
 
-        auto am_send_block = comm.make_active_msg(
-            [&](int& i, int &j, view<double> &Aij) {
-                auto &b = this->blocs.at({i,j});
-                b->allocate();                
-                memcpy(b->A()->data(), Aij.data(), Aij.size() * sizeof(double));
-            });        
+        // auto am_send_block = comm.make_active_msg(
+        //     [&](int& i, int &j, view<double> &Aij) {
+        //         auto &b = this->blocs.at({i,j});
+        //         b->allocate();                
+        //         memcpy(b->A()->data(), Aij.data(), Aij.size() * sizeof(double));
+        //     });        
 
         // Exchange data back to process 0 for solve
-        if (comm_rank() != 0)
-        {
-            for (int k = 0; k < nblk; k++)
-            {                
-                auto &n = nodes.at(k);
-                if(ij2rank({k,k}) == comm_rank()) { // Pivot
-                    auto *Akk = blocs.at({k,k})->A();
-                    auto vAkk = view<double>(Akk->data(), Akk->size());
-                    am_send_block->blocking_send(0, k,k, vAkk);
-                }
-                for (auto i : n->nbrs)
-                {
-                    if(ij2rank({i,k}) == comm_rank()) { // Panel
-                        MatrixXd *Aik = blocs.at({i,k})->A();
-                        auto vAik = view<double>(Aik->data(), Aik->size());
-                        am_send_block->blocking_send(0, i, k, vAik);
-                    }
-                }
-            }
-        }
-        else
-        {
-            for (int k = 0; k < nblk; k++)
-            {
-                auto &n = nodes.at(k);
-                if(ij2rank({k,k}) != comm_rank()) {
-                    comm.recv_process();
-                }
-                for (auto i : n->nbrs)
-                {
-                    if(ij2rank({i,k}) != comm_rank()) { 
-                        comm.recv_process();
-                    }
-                }
-            }
-        }
+        // if (comm_rank() != 0)
+        // {
+        //     for (int k = 0; k < nblk; k++)
+        //     {                
+        //         auto &n = nodes.at(k);
+        //         if(ij2rank({k,k}) == comm_rank()) { // Pivot
+        //             auto *Akk = blocs.at({k,k})->A();
+        //             auto vAkk = view<double>(Akk->data(), Akk->size());
+        //             am_send_block->blocking_send(0, k,k, vAkk);
+        //         }
+        //         for (auto i : n->nbrs)
+        //         {
+        //             if(ij2rank({i,k}) == comm_rank()) { // Panel
+        //                 MatrixXd *Aik = blocs.at({i,k})->A();
+        //                 auto vAik = view<double>(Aik->data(), Aik->size());
+        //                 am_send_block->blocking_send(0, i, k, vAik);
+        //             }
+        //         }
+        //     }
+        // }
+        // else
+        // {
+        //     for (int k = 0; k < nblk; k++)
+        //     {
+        //         auto &n = nodes.at(k);
+        //         if(ij2rank({k,k}) != comm_rank()) {
+        //             comm.recv_process();
+        //         }
+        //         for (auto i : n->nbrs)
+        //         {
+        //             if(ij2rank({i,k}) != comm_rank()) { 
+        //                 comm.recv_process();
+        //             }
+        //         }
+        //     }
+        // }
 
         if (LOG > 0)
         {
@@ -826,83 +838,358 @@ struct DistMat
         }
     }
 
-    VectorXd solve(VectorXd &b)
+    // Overwrite bjj->xsol by Ljj^-1 bjj->xsol
+    void fwd_diag(int j) {        
+        // Pivot x[j] = L[j,j]^-1 x[j]
+        auto &bjj = blocs.at({j,j});
+        MatrixXd *Ljj = bjj->A();
+        cblas_dtrsv(CblasColMajor, CblasLower, CblasNoTrans, CblasNonUnit, Ljj->rows(), Ljj->data(), Ljj->rows(), bjj->xsol.data(), 1);
+    }
+
+    // Overwrite bij->xsol by - Lij bjj->xsol
+    void fwd_panel(int2 ij) {
+        // Partial panel x[i] = - L[i,j] x[j]        
+        int j = ij[1];
+        auto &bjj = blocs.at({j,j});
+        auto &bij = blocs.at(ij);
+        MatrixXd *Lij = bij->A();
+        assert(bij->rows.size() == Lij->rows());
+        VectorXd xitmp = VectorXd::Zero(Lij->rows());
+        cblas_dgemv(CblasColMajor, CblasNoTrans, Lij->rows(), Lij->cols(), -1.0, Lij->data(), Lij->rows(), bjj->xsol.data(), 1, 0.0, xitmp.data(), 1);
+        bij->xsol = xitmp;
+    }
+
+    // + Reduce bij->xsol into bii->xsol
+    void fwd_reduction(int2 ij) {
+        // Reduce partial x at [i,j] into x at [i,i]
+        int i = ij[0];
+        auto &bii = blocs.at({i,i});
+        auto &bij = blocs.at(ij);
+        auto I = get_subids(bij->rows, bii->rows);
+        assert(bij->xsol.size() == bij->rows.size());
+        assert(bii->xsol.size() == bii->rows.size());
+        lock_guard<mutex> lock(bii->xsol_mtx);
+        for (int i = 0; i < bij->xsol.size(); i++)
+        {
+            bii->xsol(I[i]) += bij->xsol(i);
+        }
+    }
+
+    // Overwrite bii->xsol by Lii^T bii->xsol
+    void bwd_diag(int k) {
+        // Pivot x[k] = Lkk^-T x[k]
+        auto &bkk = blocs.at({k,k});
+        MatrixXd *Lkk = bkk->A();
+        cblas_dtrsv(CblasColMajor, CblasLower, CblasTrans, CblasNonUnit, Lkk->rows(), Lkk->data(), Lkk->rows(), bkk->xsol.data(), 1);
+    }
+
+    // Overwrite bij->xsol by - Lij^T bii->xsol
+    void bwd_panel(int2 ij) {
+        // Partial panel x[j] -= Lij^T xn
+        int i = ij[0];
+        auto &bii = blocs.at({i,i});
+        auto &bij = blocs.at(ij);
+        auto I = get_subids(bij->rows, bii->rows);
+        MatrixXd *Lij = bij->A();        
+        VectorXd xjtmp = VectorXd::Zero(Lij->cols());
+        VectorXd xitmp = VectorXd::Zero(Lij->rows());        
+        for (int i = 0; i < bij->rows.size(); i++) {
+            xitmp[i] = bii->xsol(I[i]);
+        }
+        cblas_dgemv(CblasColMajor, CblasTrans, Lij->rows(), Lij->cols(), -1.0, Lij->data(), Lij->rows(), xitmp.data(), 1, 1.0, xjtmp.data(), 1);
+        bij->xsol = xjtmp;
+        assert(bij->xsol.size() == Lij->cols());
+    }
+
+    void bwd_reduction(int2 ij) {
+        int j = ij[1];
+        auto &bjj = blocs.at({j,j});
+        auto &bij = blocs.at(ij);
+        assert(bjj->xsol.size() == bjj->rows.size());
+        assert(bjj->xsol.size() == bij->xsol.size());
+        lock_guard<mutex> lock(bjj->xsol_mtx);
+        for (int i = 0; i < bij->xsol.size(); i++)
+        {
+            bjj->xsol(i) += bij->xsol(i);
+        }
+    }
+
+    VectorXd solve(VectorXd &b, int n_threads)
     {
-        assert(comm_rank() == 0);
         VectorXd xglob = perm.asPermutation() * b;
-        // Set solution on each node
-        for (int krow = 0; krow < nblk; krow++)
+        VectorXd xglob_sol = VectorXd::Zero(xglob.size());
+        // Set solution on each diagonal node
+        for (int k = 0; k < nblk; k++)
         {
-            auto &k = nodes.at(krow);
-            k->xsol = xglob.segment(k->start, k->size);
+            auto &b = blocs.at({k,k});
+            auto &n = nodes.at(k);
+            if(ij2rank({k,k}) == comm_rank()) {                
+                b->xsol = xglob.segment(n->start, n->size);
+            } else {
+                b->xsol = VectorXd::Zero(n->size);
+            }
         }
-        // Forward
-        for (int krow = 0; krow < nblk; krow++)
+
+        printf("Rank %d starting %d threads\n", comm_rank(), n_threads);
+        Logger log(1000000);
+        Communicator comm(VERB);
+        Threadpool tp(n_threads, &comm, VERB, "[" + to_string(comm_rank()) + "]_solve_");
+        Taskflow<int>  fwd_df(&tp, VERB);
+        Taskflow<int2> fwd_pf(&tp, VERB);
+        Taskflow<int2> bwd_pf(&tp, VERB);
+        Taskflow<int>  bwd_df(&tp, VERB);
+
+        /**
+         * FORWARD
+         **/
+
+        auto am_fwd_diag = comm.make_active_msg(
+            [&](int &j, view<double> &xj, view<int> &ff) {
+                auto& bjj = this->blocs.at({j,j});
+                bjj->xsol = VectorXd::Zero(xj.size());
+                memcpy(bjj->xsol.data(), xj.data(), xj.size() * sizeof(double));
+                for(auto i: ff) {
+                    fwd_pf.fulfill_promise({i,j});
+                }
+            });
+
+        auto am_fwd_panel = comm.make_active_msg(
+            [&](int &i, int &j, view<double> &xij) {
+                auto& bij = this->blocs.at({i,j});
+                bij->xsol = VectorXd::Zero(xij.size());
+                memcpy(bij->xsol.data(), xij.data(), xij.size() * sizeof(double));
+                fwd_reduction({i,j});
+                fwd_df.fulfill_promise(i);
+            });        
+
+        fwd_df
+            .set_mapping([&](int j) {
+                assert(ij2rank({j,j}) == comm_rank());
+                return (j % n_threads);
+            })
+            .set_indegree([&](int j) {
+                assert(ij2rank({j,j}) == comm_rank());
+                int nanc = nodes.at(j)->ancestors.size();
+                return nanc == 0 ? 1 : nanc ;
+            })
+            .set_task([&](int j) {
+                assert(ij2rank({j,j}) == comm_rank());
+                fwd_diag(j);
+            })
+            .set_fulfill([&](int j) {
+                assert(ij2rank({j,j}) == comm_rank());
+                auto& bjj = blocs.at({j,j});
+                auto& n = nodes.at(j);
+                if(n->nbrs.size() == 0) {
+                    // Trigger backward
+                    bwd_df.fulfill_promise(j);
+                } else {
+                    // Trigger forward panel under pivot
+                    // Collect tasks and ranks to fulfill
+                    map<int,vector<int>> fulfills;                    
+                    for(auto i: n->nbrs) {
+                        int dest = ij2rank({i,j});
+                        if(fulfills.count(dest) == 0) {
+                            fulfills[dest] = {i};
+                        } else {
+                            fulfills[dest].push_back(i);
+                        }
+                    }
+                    // Send data and fulfill dependency
+                    auto vxsol = view<double>(bjj->xsol.data(), bjj->xsol.size());
+                    for(auto dest_ff: fulfills) {
+                        auto vff = view<int>(dest_ff.second.data(), dest_ff.second.size());
+                        if(dest_ff.first == comm_rank()) { // Local: just ff
+                            for(auto i: vff) {
+                                fwd_pf.fulfill_promise({i,j});
+                            }
+                        } else { // Remote: send data & ff
+                            am_fwd_diag->send(dest_ff.first,j,vxsol,vff);
+                        }
+                    }
+                }                
+            })
+            .set_name([&](int j) {
+                return "[" + to_string(comm_rank()) + "]_fwd_diag_" + to_string(j);
+            });
+
+        fwd_pf
+            .set_mapping([&](int2 ij) {
+                assert(ij2rank(ij) == comm_rank());
+                return (ij[0] % n_threads);
+            })
+            .set_indegree([&](int2 ij) {
+                assert(ij2rank(ij) == comm_rank());
+                return 1;
+            })
+            .set_task([&](int2 ij) {
+                assert(ij2rank(ij) == comm_rank());
+                fwd_panel(ij);
+            })
+            .set_fulfill([&](int2 ij) {
+                assert(ij2rank(ij) == comm_rank());
+                int i = ij[0];
+                int j = ij[1];
+                int dest = ij2rank({i,i});
+                auto &bij = blocs.at(ij);
+                if(dest == comm_rank()) {
+                    fwd_reduction(ij);
+                    fwd_df.fulfill_promise(i);
+                } else {
+                    auto vxsol = view<double>(bij->xsol.data(), bij->xsol.size());
+                    am_fwd_panel->send(dest, i, j, vxsol);
+                }                
+            })
+            .set_name([&](int2 ij) {
+                return "[" + to_string(comm_rank()) + "]_fwd_panel_" + to_string(ij[0]) + "_" + to_string(ij[1]);;
+            });
+
+        /**
+         * BACKWARD
+         */
+
+        auto am_bwd_diag = comm.make_active_msg(
+            [&](int &i, view<double> &xi, view<int> &ff) {
+                auto& bii = this->blocs.at({i,i});
+                bii->xsol = VectorXd::Zero(xi.size());
+                memcpy(bii->xsol.data(), xi.data(), xi.size() * sizeof(double));
+                for(auto j: ff) {
+                    bwd_pf.fulfill_promise({i,j});
+                }
+            });
+
+        auto am_bwd_panel = comm.make_active_msg(
+            [&](int &i, int &j, view<double> &xij) {
+                auto& bij = this->blocs.at({i,j});
+                bij->xsol = VectorXd::Zero(xij.size());
+                memcpy(bij->xsol.data(), xij.data(), xij.size() * sizeof(double));
+                this->bwd_reduction({i,j});
+                bwd_df.fulfill_promise(j);
+            });
+
+        auto am_send_sol = comm.make_active_msg(
+            [&](int &j, view<double> &xj) {
+                int start = nodes.at(j)->start;
+                for(int i = 0; i < xj.size(); i++) {
+                    xglob_sol[start + i] = xj.data()[i];
+                }
+            });
+
+        bwd_df
+            .set_mapping([&](int i) {
+                assert(ij2rank({i,i}) == comm_rank());
+                return (i % n_threads);
+            })
+            .set_indegree([&](int i) {
+                assert(ij2rank({i,i}) == comm_rank());
+                int nnbrs = nodes.at(i)->nbrs.size();
+                return nnbrs == 0 ? 1 : nnbrs ; // If no neighbors, its triggered by fwd diag ; otherwise, by its nbrs
+            })
+            .set_task([&](int i) {
+                assert(ij2rank({i,i}) == comm_rank());
+                bwd_diag(i);
+            })
+            .set_fulfill([&](int i) {
+                assert(ij2rank({i,i}) == comm_rank());
+                auto& bii = blocs.at({i,i});
+                auto &n = nodes.at(i);
+                // Collect tasks and ranks to fulfill
+                map<int,vector<int>> fulfills;                
+                for(auto j: n->ancestors) {
+                    int dest = ij2rank({i,j});
+                    if(fulfills.count(dest) == 0) {
+                        fulfills[dest] = {j};
+                    } else {
+                        fulfills[dest].push_back(j);
+                    }
+                }
+                // Send data and fulfill dependency
+                auto vxsol = view<double>(bii->xsol.data(), bii->xsol.size());
+                for(auto dest_ff: fulfills) {
+                    auto vff = view<int>(dest_ff.second.data(), dest_ff.second.size());
+                    if(dest_ff.first == comm_rank()) { // Local: just ff
+                        for(auto j: vff) {                        
+                            bwd_pf.fulfill_promise({i,j});
+                        }
+                    } else { // Remote: send data & ff
+                        am_bwd_diag->send(dest_ff.first,i,vxsol,vff);
+                    }
+                }
+                // Write solution to xglob_sol
+                if(comm_rank() == 0) {                    
+                    xglob_sol.segment(n->start, n->size) = bii->xsol;
+                } else {
+                    am_send_sol->send(0, i, vxsol);
+                }
+            })
+            .set_name([&](int j) {
+                return "[" + to_string(comm_rank()) + "]_bwd_diag_" + to_string(j);
+            });
+
+        bwd_pf
+            .set_mapping([&](int2 ij) {
+                assert(ij2rank(ij) == comm_rank());
+                return (ij[0] % n_threads);
+            })
+            .set_indegree([&](int2 ij) {
+                assert(ij2rank(ij) == comm_rank());
+                return 1;
+            })
+            .set_task([&](int2 ij) {
+                assert(ij2rank(ij) == comm_rank());
+                bwd_panel(ij);
+            })
+            .set_fulfill([&](int2 ij) {
+                assert(ij2rank(ij) == comm_rank());
+                int i = ij[0];
+                int j = ij[1];
+                int dest = ij2rank({j,j});
+                auto &bij = blocs.at(ij);
+                if(dest == comm_rank()) {
+                    bwd_reduction(ij);
+                    bwd_df.fulfill_promise(j);
+                } else {
+                    auto vxsol = view<double>(bij->xsol.data(), bij->xsol.size());
+                    am_bwd_panel->send(dest, i, j, vxsol);
+                }   
+            })
+            .set_name([&](int2 ij) {
+                return "[" + to_string(comm_rank()) + "]_bwd_panel_" + to_string(ij[0]) + "_" + to_string(ij[1]);;
+            });
+
+        // Start by seeding initial tasks
+        MPI_Barrier(MPI_COMM_WORLD);
+        timer t0 = wctime();
+        for (int k = 0; k < nblk; k++)
         {
-            auto &k = nodes.at(krow);
-            // Pivot xs <- Lss^-1 xs
-            MatrixXd *Lss = blocs.at({krow, krow})->A();
-            cblas_dtrsv(CblasColMajor, CblasLower, CblasNoTrans, CblasNonUnit, Lss->rows(), Lss->data(), Lss->rows(), k->xsol.data(), 1);
-            // Neighbors
-            for (int irow : k->nbrs)
+            if (ij2rank({k,k}) == comm_rank())
             {
-                auto &n = nodes.at(irow);
-                MatrixXd *Lns = blocs.at({irow, krow})->A();
-                VectorXd xn(Lns->rows());
-                // xn = -Lns xs
-                cblas_dgemv(CblasColMajor, CblasNoTrans, Lns->rows(), Lns->cols(), -1.0, Lns->data(), Lns->rows(), k->xsol.data(), 1, 0.0, xn.data(), 1);
-                // Reduce into xn
-                auto I = get_subids(blocs.at({irow, krow})->rows, blocs.at({irow, irow})->cols);
-                for (int i = 0; i < xn.size(); i++)
+                if (nodes.at(k)->ancestors.size() == 0)
                 {
-                    n->xsol(I[i]) += xn(i);
+                    fwd_df.fulfill_promise(k);
                 }
             }
         }
-        // Backward
-        for (int krow = nblk - 1; krow >= 0; krow--)
-        {
-            auto &k = nodes.at(krow);
-            // Neighbors
-            for (int irow : k->nbrs)
-            {
-                auto &n = nodes.at(irow);
-                MatrixXd *Lns = blocs.at({irow, krow})->A();
-                VectorXd xn(Lns->rows());
-                // Fetch from xn
-                auto I = get_subids(blocs.at({irow, krow})->rows, blocs.at({irow, irow})->cols);
-                for (int i = 0; i < xn.size(); i++)
-                {
-                    xn(i) = n->xsol(I[i]);
-                }
-                // xs -= Lns^T xn
-                cblas_dgemv(CblasColMajor, CblasTrans, Lns->rows(), Lns->cols(), -1.0, Lns->data(), Lns->rows(), xn.data(), 1, 1.0, k->xsol.data(), 1);
-            }
-            // xs = Lss^-T xs
-            MatrixXd *Lss = blocs.at({krow, krow})->A();
-            cblas_dtrsv(CblasColMajor, CblasLower, CblasTrans, CblasNonUnit, Lss->rows(), Lss->data(), Lss->rows(), k->xsol.data(), 1);
-        }
-        // Back to x
-        for (int krow = 0; krow < nblk; krow++)
-        {
-            auto &k = nodes.at(krow);
-            xglob.segment(k->start, k->size) = k->xsol;
-        }
-        return perm.asPermutation().transpose() * xglob;
+        tp.join();
+        MPI_Barrier(MPI_COMM_WORLD);
+        timer t1 = wctime();
+        printf("[%d] Solve done, time %3.2e s.\n", comm_rank(), elapsed(t0, t1));
+        return perm.asPermutation().transpose() * xglob_sol;
     }
 };
 
 TEST(snchol, one)
 {
     printf("[%d] Hello from %s\n", comm_rank(), processor_name().c_str());
+    assert(PROWS * PCOLS == comm_size());
     DistMat dm(FILENAME, N_LEVELS, BLOCK_SIZE, PROWS, PCOLS);
+    SpMat A = dm.A;
     dm.factorize(N_THREADS);
+    VectorXd b = random(A.rows(), 2019);
+    VectorXd x = dm.solve(b, N_THREADS);
     // Testing
     if (comm_rank() == 0)
-    {
-        SpMat A = dm.A;
-        VectorXd b = random(A.rows(), 2019);
-        VectorXd x = dm.solve(b);
+    {        
         double res = (A * x - b).norm() / b.norm();
         ASSERT_LE(res, 1e-12);
         printf("|Ax-b|/|b| = %e\n", res);
