@@ -782,51 +782,6 @@ struct DistMat
         printf("[%d] Scat %3.2e s., %3.2e s./thread\n", comm_rank(), double(scat_us / 1e6), double(scat_us / 1e6) / n_threads);
         printf(">>>>%d,%d,%d,%3.2e\n", comm_rank(), comm_size(), n_threads, elapsed(t0, t1));
 
-        // auto am_send_block = comm.make_active_msg(
-        //     [&](int& i, int &j, view<double> &Aij) {
-        //         auto &b = this->blocs.at({i,j});
-        //         b->allocate();                
-        //         memcpy(b->A()->data(), Aij.data(), Aij.size() * sizeof(double));
-        //     });        
-
-        // Exchange data back to process 0 for solve
-        // if (comm_rank() != 0)
-        // {
-        //     for (int k = 0; k < nblk; k++)
-        //     {                
-        //         auto &n = nodes.at(k);
-        //         if(ij2rank({k,k}) == comm_rank()) { // Pivot
-        //             auto *Akk = blocs.at({k,k})->A();
-        //             auto vAkk = view<double>(Akk->data(), Akk->size());
-        //             am_send_block->blocking_send(0, k,k, vAkk);
-        //         }
-        //         for (auto i : n->nbrs)
-        //         {
-        //             if(ij2rank({i,k}) == comm_rank()) { // Panel
-        //                 MatrixXd *Aik = blocs.at({i,k})->A();
-        //                 auto vAik = view<double>(Aik->data(), Aik->size());
-        //                 am_send_block->blocking_send(0, i, k, vAik);
-        //             }
-        //         }
-        //     }
-        // }
-        // else
-        // {
-        //     for (int k = 0; k < nblk; k++)
-        //     {
-        //         auto &n = nodes.at(k);
-        //         if(ij2rank({k,k}) != comm_rank()) {
-        //             comm.recv_process();
-        //         }
-        //         for (auto i : n->nbrs)
-        //         {
-        //             if(ij2rank({i,k}) != comm_rank()) { 
-        //                 comm.recv_process();
-        //             }
-        //         }
-        //     }
-        // }
-
         if (LOG > 0)
         {
             ofstream logfile;
