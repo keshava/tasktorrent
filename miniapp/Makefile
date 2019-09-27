@@ -2,7 +2,7 @@ include Makefile.conf
 
 INCLUDE  = -I../src/ -I$(EIGEN_INCDIR)  -I$(SCOTCH_INCDIR) -I$(MMIO_INCDIR) -isystem $(GTEST_INCDIR)
 LIBS     = -L$(SCOTCH_LIBDIR) $(GTEST_LIBDIR)/libgtest.a
-LDFLAGS  = -l scotch -l scotcherr -l tbb
+LDFLAGS  = -l scotch -l scotcherr
 SRCDIR   = ../src
 OBJDIR   = ../build
 
@@ -35,6 +35,9 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.cpp $(DEPS)
 snchol: snchol.cpp $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(INCLUDE) $(LIBS) $(LDFLAGS)
 
+snchol_2d: snchol_2d.cpp $(OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(INCLUDE) $(LIBS) $(LDFLAGS)
+
 clean:
-	-rm -f *.o *.log ../build/.*o
-	-rm -f snchol
+	rm -f *.o *.log ../build/*.o
+	rm -f snchol snchol_2d

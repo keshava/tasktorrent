@@ -65,15 +65,15 @@ struct range
     int k;
 };
 
-int3 lower(int3 kij)
+int3 lower(int3 ijk)
 {
-    int k = kij[0];
-    int i = kij[1];
-    int j = kij[2];
+    int i = ijk[0];
+    int j = ijk[1];
+    int k = ijk[2];
     if (i >= j)
-        return kij;
+        return ijk;
     else
-        return {k, j, i};
+        return {j,i,k};
 };
 
 // Find the positions of c_rows into p_rows
@@ -296,8 +296,8 @@ struct DistMat
             n->nbrs = vector<int>(nbrs_tmp.begin(), nbrs_tmp.end());
             sort(n->nbrs.begin(), n->nbrs.end());
             // Diagonal bloc
-            blocs[{k, k}] = make_unique<Bloc>();
-            auto &b = blocs.at({k, k});
+            blocs[{k,k}] = make_unique<Bloc>();
+            auto &b = blocs.at({k,k});
             b->rows = kcols;
             b->cols = kcols;
             if(ij2rank({k,k}) == comm_rank()) {                
@@ -392,7 +392,7 @@ struct DistMat
             auto &n = nodes.at(k);
             int start = n->start;
             int size = n->size;
-            Aff.block(start, start, size, size) = blocs.at({k, k})->A()->triangularView<Lower>();
+            Aff.block(start, start, size, size) = blocs.at({k,k})->A()->triangularView<Lower>();
             for (auto i : n->nbrs)
             {
                 MatrixXd *Aik = blocs.at({i, k})->A();
@@ -434,63 +434,68 @@ struct DistMat
         trsm_us += (long long)(elapsed(t0, t1) * 1e6);
     }
 
-    // Perform a gemm between (i,k) and (j,k) and store the result at (i,j) in to_accumulate
-    void gemm(int3 kijrow)
+    // Perform a gemm between A[i,k] and A[j,k] and store the result at A[i,j] to be accumulated later
+    void gemm(int3 ijk)
     {
-        int krow = kijrow[0];
-        int irow = kijrow[1];
-        int jrow = kijrow[2];
-        MatrixXd *Ais = blocs.at({irow, krow})->A();
-        MatrixXd *Ajs = blocs.at({jrow, krow})->A();
+        int i = ijk[0];
+        int j = ijk[1];
+        int k = ijk[2];        
+        assert(i >= j);
+        assert(j >  k);
+        MatrixXd *Aik = blocs.at({i,k})->A();
+        MatrixXd *Ajk = blocs.at({j,k})->A();
+        assert(Aik->cols() == Ajk->cols());
         // Do the math
         timer t0, t1, t2;
         t0 = wctime();
-        auto Aij_acc = make_unique<MatrixXd>(Ais->rows(), Ajs->rows());
+        auto Aij_acc = make_unique<MatrixXd>(Aik->rows(), Ajk->rows());
         t1 = wctime();
-        if (jrow == irow)
-        { // Aii_ = -Ais Ais^T
+        if (j == i)
+        { // Aii_ = -Aik Aik^T
             cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans,
-                        Ais->rows(), Ais->cols(), -1.0, Ais->data(), Ais->rows(), 0.0, Aij_acc->data(), Aij_acc->rows());
+                        Aik->rows(), Aik->cols(), -1.0, Aik->data(), Aik->rows(), 0.0, Aij_acc->data(), Aij_acc->rows());
         }
         else
-        { // Aij_ = -Ais Ajs^T
+        { // Aij_ = -Aik Ajk^T
             cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans,
-                        Ais->rows(), Ajs->rows(), Ais->cols(), -1.0, Ais->data(), Ais->rows(), Ajs->data(), Ajs->rows(), 0.0, Aij_acc->data(), Aij_acc->rows());
+                        Aik->rows(), Ajk->rows(), Aik->cols(), -1.0, Aik->data(), Aik->rows(), Ajk->data(), Ajk->rows(), 0.0, Aij_acc->data(), Aij_acc->rows());
         }
         t2 = wctime();
         {
-            auto &mtx = blocs.at({irow, jrow})->to_accumulate_mtx;
-            auto &acc = blocs.at({irow, jrow})->to_accumulate;
+            auto &mtx = blocs.at({i,j})->to_accumulate_mtx;
+            auto &acc = blocs.at({i,j})->to_accumulate;
             lock_guard<mutex> lock(mtx);
-            acc[krow] = move(Aij_acc);
+            acc[k] = move(Aij_acc);
         }
         allo_us += (long long)(elapsed(t0, t1) * 1e6);
         gemm_us += (long long)(elapsed(t1, t2) * 1e6);
     }
 
-    void accumulate(int3 kijrow)
+    void accumulate(int3 ijk)
     {
-        int krow = kijrow[0];
-        int irow = kijrow[1];
-        int jrow = kijrow[2];
-        auto &mtx = blocs.at({irow, jrow})->to_accumulate_mtx;
-        auto &acc = blocs.at({irow, jrow})->to_accumulate;
+        int i = ijk[0];
+        int j = ijk[1];
+        int k = ijk[2];        
+        assert(i >= j);
+        assert(j >  k);
+        auto &mtx = blocs.at({i,j})->to_accumulate_mtx;
+        auto &acc = blocs.at({i,j})->to_accumulate;
         {
-            assert(!blocs.at({irow, jrow})->accumulating_busy.load());
-            blocs.at({irow, jrow})->accumulating_busy.store(true);
+            assert(!blocs.at({i,j})->accumulating_busy.load());
+            blocs.at({i,j})->accumulating_busy.store(true);
         }
         unique_ptr<MatrixXd> Aij_acc;
-        MatrixXd *Aij = blocs.at({irow, jrow})->A();
+        MatrixXd *Aij = blocs.at({i,j})->A();
         timer t0, t1;
         {
             lock_guard<mutex> lock(mtx);
-            Aij_acc = move(acc.at(krow));
-            acc.erase(acc.find(krow));
+            Aij_acc = move(acc.at(k));
+            acc.erase(acc.find(k));
         }
         t0 = wctime();
-        if (jrow == irow)
-        { // Aii_ = -Ais Ais^T
-            auto I = get_subids(blocs.at({irow, krow})->rows, blocs.at({irow, jrow})->rows);
+        if (j == i)
+        { // Aii_ = -Aik Aik^T
+            auto I = get_subids(blocs.at({i,k})->rows, blocs.at({i,j})->rows);
             for (int j = 0; j < Aij_acc->cols(); j++)
             {
                 for (int i = j; i < Aij_acc->rows(); i++)
@@ -500,9 +505,9 @@ struct DistMat
             }
         }
         else
-        { // Aij_ = -Ais Ajs^T
-            auto I = get_subids(blocs.at({irow, krow})->rows, blocs.at({irow, jrow})->rows);
-            auto J = get_subids(blocs.at({jrow, krow})->rows, blocs.at({irow, jrow})->cols);
+        { // Aij_ = -Aik Ajk^T
+            auto I = get_subids(blocs.at({i,k})->rows, blocs.at({i,j})->rows);
+            auto J = get_subids(blocs.at({j,k})->rows, blocs.at({i,j})->cols);
             for (int j = 0; j < Aij_acc->cols(); j++)
             {
                 for (int i = 0; i < Aij_acc->rows(); i++)
@@ -514,8 +519,8 @@ struct DistMat
         t1 = wctime();
         scat_us += (long long)(elapsed(t0, t1) * 1e6);
         {
-            assert(blocs.at({irow, jrow})->accumulating_busy.load());
-            blocs.at({irow, jrow})->accumulating_busy.store(false);
+            assert(blocs.at({i,j})->accumulating_busy.load());
+            blocs.at({i,j})->accumulating_busy.store(false);
         }
     }
 
@@ -539,9 +544,9 @@ struct DistMat
                 for (auto j : fulfill)
                 {   
                     if(i == k) {
-                        tf.fulfill_promise({k,j});
-                    } else {                    
-                        gf.fulfill_promise(lower({k,i,j}));
+                        tf.fulfill_promise({j,k});
+                    } else {
+                        gf.fulfill_promise(lower({i,j,k}));
                     }
                 }
             });
@@ -563,16 +568,16 @@ struct DistMat
             })
             .set_indegree([&](int k) {
                 assert(ij2rank({k,k}) == comm_rank());
-                int nacc = n_to_accumulate({k, k});
+                int nacc = n_to_accumulate({k,k});
                 return nacc == 0 ? 1 : nacc ; // 1 (seeding) or # gemms before
             })
             .set_task([&](int k) {
-                assert(accumulated({k, k}) == n_to_accumulate({k, k}));
+                assert(accumulated({k,k}) == n_to_accumulate({k,k}));
                 assert(ij2rank({k,k}) == comm_rank());
                 potf(k);
             })
             .set_fulfill([&](int k) {
-                assert(accumulated({k, k}) == n_to_accumulate({k, k}));
+                assert(accumulated({k,k}) == n_to_accumulate({k,k}));
                 assert(ij2rank({k,k}) == comm_rank());
                 // Collect tasks and ranks to fulfill
                 map<int,vector<int>> fulfills;
@@ -591,10 +596,10 @@ struct DistMat
                     auto vff = view<int>(dest_ff.second.data(), dest_ff.second.size());
                     if(dest_ff.first == comm_rank()) { // Local: just ff
                         for(auto i: vff) {
-                            tf.fulfill_promise({k,i});
+                            tf.fulfill_promise({i,k});
                         }
                     } else { // Remote: send data & ff
-                        am->send(dest_ff.first, k, k, vAkk, vff);
+                        am->send(dest_ff.first, k,k, vAkk, vff);
                     }
                 }
             })
@@ -610,33 +615,33 @@ struct DistMat
          * Inputs are assumed to be there and ready
          **/
         tf
-            .set_mapping([&](int2 ki) {
-                assert(ij2rank({ki[1], ki[0]}) == comm_rank());
-                return (ki[0] % n_threads);
+            .set_mapping([&](int2 ik) {
+                assert(ij2rank(ik) == comm_rank());
+                return (ik[1] % n_threads);
             })
-            .set_indegree([&](int2 ki) {
-                assert(ij2rank({ki[1], ki[0]}) == comm_rank());
-                int k = ki[0];
-                int i = ki[1];
+            .set_indegree([&](int2 ik) {
+                assert(ij2rank(ik) == comm_rank());
+                int i = ik[0];
+                int k = ik[1];
                 assert(i > k);
-                return 1 + n_to_accumulate({i, k}); // above potf + # gemm before
+                return 1 + n_to_accumulate({i,k}); // above potf + # gemm before
             })
-            .set_task([&](int2 ki) {
-                assert(ij2rank({ki[1], ki[0]}) == comm_rank());
-                assert(accumulated({ki[1], ki[0]}) == n_to_accumulate({ki[1], ki[0]}));
-                trsm(ki);
+            .set_task([&](int2 ik) {
+                assert(ij2rank(ik) == comm_rank());
+                assert(accumulated(ik) == n_to_accumulate(ik));
+                trsm(ik);
             })
-            .set_fulfill([&](int2 ki) {
-                assert(ij2rank({ki[1], ki[0]}) == comm_rank());
-                assert(accumulated({ki[1], ki[0]}) == n_to_accumulate({ki[1], ki[0]}));                
-                // Collect tasks and ranks to fulfill
-                int k = ki[0];
-                int i = ki[1];
+            .set_fulfill([&](int2 ik) {
+                assert(ij2rank(ik) == comm_rank());
+                assert(accumulated(ik) == n_to_accumulate(ik));
+                // Collect tasks and ranks to fulfill                
+                int i = ik[0];
+                int k = ik[1];
                 auto& n = nodes.at(k);
                 map<int,vector<int>> fulfills;
                 for(auto j: n->nbrs) {
-                    auto kij = lower({k,i,j});
-                    int dest = ij2rank({kij[1], kij[2]});
+                    auto gijk = lower({i,j,k});
+                    int dest = ij2rank({gijk[0], gijk[1]});
                     if(fulfills.count(dest) == 0) {
                         fulfills[dest] = {j};
                     } else {
@@ -649,17 +654,17 @@ struct DistMat
                     auto vff = view<int>(dest_ff.second.data(), dest_ff.second.size());
                     if(dest_ff.first == comm_rank()) { // Local: just ff
                         for(auto j: vff) {
-                            gf.fulfill_promise(lower({k,i,j})); // gemms after
+                            gf.fulfill_promise(lower({i,j,k})); // gemms after
                         }
                     } else { // Remote: send data & ff
                         am->send(dest_ff.first, i, k, vAik, vff);
                     }
                 }                
             })
-            .set_name([&](int2 ki) {
-                return "[" + to_string(comm_rank()) + "]_trsm_" + to_string(ki[0]) + "_" + to_string(ki[1]);
+            .set_name([&](int2 ik) {
+                return "[" + to_string(comm_rank()) + "]_trsm_" + to_string(ik[0]) + "_" + to_string(ik[1]);
             })
-            .set_priority([](int2 k) {
+            .set_priority([](int2 ik) {
                 return 2.0;
             });
 
@@ -668,35 +673,34 @@ struct DistMat
          * Both inputs are assumed to be on the node, and the output is at the same location, ready to be reduces
          **/
         gf
-            .set_mapping([&](int3 kij) {
-                assert(ij2rank({kij[1], kij[2]}) == comm_rank());
-                return (kij[0] % n_threads);
+            .set_mapping([&](int3 ijk) {
+                assert(ij2rank({ijk[0], ijk[1]}) == comm_rank());
+                return (ijk[2] % n_threads);
             })
-            .set_indegree([&](int3 kij) {
-                assert(ij2rank({kij[1], kij[2]}) == comm_rank());
-                int i = kij[1];
-                int j = kij[2];
-                assert(j <= i);
+            .set_indegree([&](int3 ijk) {
+                assert(ij2rank({ijk[0], ijk[1]}) == comm_rank());
+                int i = ijk[0];
+                int j = ijk[1];
+                assert(i >= j);
                 return (i == j ? 1 : 2); // 1 potf or 2 trsms
             })
-            .set_task([&](int3 kij) {
-                assert(ij2rank({kij[1], kij[2]}) == comm_rank());
-                gemm(kij);
+            .set_task([&](int3 ijk) {
+                assert(ij2rank({ijk[0], ijk[1]}) == comm_rank());
+                gemm(ijk);
             })
-            .set_fulfill([&](int3 kij) {
-                assert(ij2rank({kij[1], kij[2]}) == comm_rank());
-                int k = kij[0];
-                int i = kij[1];
-                int j = kij[2];
-                assert(k <= j);
-                assert(j <= i);
-                // printf("gf %d %d %d -> rf %d %d %d\n", comm_rank(), k, i, j, k, i, j);
-                rf.fulfill_promise(kij); // The corresponding reduction
+            .set_fulfill([&](int3 ijk) {
+                assert(ij2rank({ijk[0], ijk[1]}) == comm_rank());
+                int i = ijk[0];
+                int j = ijk[1];
+                int k = ijk[2];
+                assert(i >= j);
+                assert(j >  k);
+                rf.fulfill_promise(ijk); // The corresponding reduction
             })
-            .set_name([&](int3 kij) {
-                return "[" + to_string(comm_rank()) + "]_gemm_" + to_string(kij[0]) + "_" + to_string(kij[1]) + "_" + to_string(kij[2]);
+            .set_name([&](int3 ijk) {
+                return "[" + to_string(comm_rank()) + "]_gemm_" + to_string(ijk[0]) + "_" + to_string(ijk[1]) + "_" + to_string(ijk[2]);
             })
-            .set_priority([](int3 k) {
+            .set_priority([](int3 ijk) {
                 return 1.0;
             });
 
@@ -705,41 +709,39 @@ struct DistMat
          * Inputs are assumed to be there, and outputs is at the same location
          **/
         rf
-            .set_mapping([&](int3 kij) {
-                assert(ij2rank({kij[1], kij[2]}) == comm_rank());
-                return (kij[1] + kij[2]) % n_threads; // any i & j -> same thread. So k cannot appear in this expression
+            .set_mapping([&](int3 ijk) {
+                assert(ij2rank({ijk[0], ijk[1]}) == comm_rank());
+                return (ijk[0] + ijk[1]) % n_threads; // any i & j -> same thread. So k cannot appear in this expression
             })
-            .set_indegree([&](int3 kij) {
-                assert(ij2rank({kij[1], kij[2]}) == comm_rank());
+            .set_indegree([&](int3 ijk) {
+                assert(ij2rank({ijk[0], ijk[1]}) == comm_rank());
                 return 1; // The corresponding gemm
             })
-            .set_task([&](int3 kij) {
-                assert(ij2rank({kij[1], kij[2]}) == comm_rank());
-                blocs.at({kij[1], kij[2]})->accumulated++;
-                accumulate(kij);
+            .set_task([&](int3 ijk) {
+                assert(ij2rank({ijk[0], ijk[1]}) == comm_rank());
+                blocs.at({ijk[0], ijk[1]})->accumulated++;
+                accumulate(ijk);
             })
-            .set_fulfill([&](int3 kij) {
-                assert(ij2rank({kij[1], kij[2]}) == comm_rank());
-                int i = kij[1];
-                int j = kij[2];
+            .set_fulfill([&](int3 ijk) {
+                assert(ij2rank({ijk[0], ijk[1]}) == comm_rank());
+                int i = ijk[0];
+                int j = ijk[1];
                 if (i == j)
                 {
-                    // printf("rf %d %d %d -> pf %d\n", k, i, j, i);
                     pf.fulfill_promise(i); // Corresponding potf
                 }
                 else
                 {
-                    // printf("rf %d %d %d -> tf %d %d\n", k, i, j, j, i);
-                    tf.fulfill_promise({j, i}); // Corresponding trsm
+                    tf.fulfill_promise({i,j}); // Corresponding trsm
                 }
             })
-            .set_name([&](int3 kij) {
-                return "[" + to_string(comm_rank()) + "]_acc_" + to_string(kij[0]) + "_" + to_string(kij[1]) + "_" + to_string(kij[2]);
+            .set_name([&](int3 ijk) {
+                return "[" + to_string(comm_rank()) + "]_acc_" + to_string(ijk[0]) + "_" + to_string(ijk[1]) + "_" + to_string(ijk[2]);
             })
-            .set_priority([](int3 k) {
+            .set_priority([](int3 ijk) {
                 return 4.0;
             })
-            .set_binding([](int3 k) {
+            .set_binding([](int3 ijk) {
                 return true; // Bind task to thread
             });
 
@@ -769,10 +771,10 @@ struct DistMat
         printf(">>>>%d,%d,%d,%3.2e\n", comm_rank(), comm_size(), n_threads, elapsed(t0, t1));
 
         auto am_send_block = comm.make_active_msg(
-            [&](int& i, int &k, view<double> &Aik) {
-                auto &b = this->blocs.at({i, k});
+            [&](int& i, int &j, view<double> &Aij) {
+                auto &b = this->blocs.at({i,j});
                 b->allocate();                
-                memcpy(b->A()->data(), Aik.data(), Aik.size() * sizeof(double));
+                memcpy(b->A()->data(), Aij.data(), Aij.size() * sizeof(double));
             });        
 
         // Exchange data back to process 0 for solve
@@ -784,7 +786,7 @@ struct DistMat
                 if(ij2rank({k,k}) == comm_rank()) { // Pivot
                     auto *Akk = blocs.at({k,k})->A();
                     auto vAkk = view<double>(Akk->data(), Akk->size());
-                    am_send_block->blocking_send(0, k, k, vAkk);
+                    am_send_block->blocking_send(0, k,k, vAkk);
                 }
                 for (auto i : n->nbrs)
                 {
