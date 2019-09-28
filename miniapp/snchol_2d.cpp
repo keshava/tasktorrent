@@ -431,7 +431,7 @@ struct DistMat
         assert(err == 0);
     }
 
-    // Trsm a panel bloc A[i,j] in-place
+    // Trsm a panel bloc A[i,j] using A[j,j] in-place
     void trsm(int2 ij)
     {
         int i = ij[0];
@@ -446,7 +446,7 @@ struct DistMat
         trsm_us += (long long)(elapsed(t0, t1) * 1e6);
     }
 
-    // Perform a gemm between A[i,k] and A[j,k] and store the result at A[i,j] to be accumulated later
+    // Perform a gemm between A[i,k] and A[j,k] and store the result at A[i,j]-k to be accumulated later
     void gemm(int3 ijk)
     {
         int i = ijk[0];
@@ -483,6 +483,7 @@ struct DistMat
         gemm_us += (long long)(elapsed(t1, t2) * 1e6);
     }
 
+    // Accumulate A[i,j]-k into A[i,j]
     void accumulate(int3 ijk)
     {
         int i = ijk[0];
@@ -548,6 +549,9 @@ struct DistMat
         Taskflow<int3> gf(&tp, VERB);
         Taskflow<int3> rf(&tp, VERB);        
 
+        // Send a block A[i,k] and fulfill a sequence of dependencies [j]
+        // If i == k, dependencies are TRSM's at [j,k]
+        // If i != k, dependencies are GEMM's at lower([i,j,k])
         auto am = comm.make_active_msg(
             [&](int &i, int &k, view<double> &Aik, view<int> &fulfill) {
                 auto& b = this->blocs.at({i,k});
@@ -682,7 +686,7 @@ struct DistMat
 
         /**
          * GEMM is 100% local.
-         * Both inputs are assumed to be on the node, and the output is at the same location, ready to be reduces
+         * Both inputs and output are on the node
          **/
         gf
             .set_mapping([&](int3 ijk) {
@@ -718,7 +722,7 @@ struct DistMat
 
         /**
          * REDUCTION is 100% local
-         * Inputs are assumed to be there, and outputs is at the same location
+         * Input and output are on the node
          **/
         rf
             .set_mapping([&](int3 ijk) {
@@ -731,7 +735,7 @@ struct DistMat
             })
             .set_task([&](int3 ijk) {
                 assert(ij2rank({ijk[0], ijk[1]}) == comm_rank());
-                blocs.at({ijk[0], ijk[1]})->accumulated++;
+                blocs.at({ijk[0], ijk[1]})->accumulated++; // DEBUG
                 accumulate(ijk);
             })
             .set_fulfill([&](int3 ijk) {
@@ -757,7 +761,7 @@ struct DistMat
                 return true; // Bind task to thread
             });
 
-        // // Start by seeding initial tasks
+        // Start by seeding initial tasks
         MPI_Barrier(MPI_COMM_WORLD);
         timer t0 = wctime();
         for (int k = 0; k < nblk; k++)
@@ -793,15 +797,15 @@ struct DistMat
         }
     }
 
-    // Overwrite bjj->xsol by Ljj^-1 bjj->xsol
-    void fwd_diag(int j) {        
+    // Overwrite bjj->xsol by (Ljj^-1 bjj->xsol)
+    void fwd_diag(int j) {
         // Pivot x[j] = L[j,j]^-1 x[j]
         auto &bjj = blocs.at({j,j});
         MatrixXd *Ljj = bjj->A();
         cblas_dtrsv(CblasColMajor, CblasLower, CblasNoTrans, CblasNonUnit, Ljj->rows(), Ljj->data(), Ljj->rows(), bjj->xsol.data(), 1);
     }
 
-    // Overwrite bij->xsol by - Lij bjj->xsol
+    // Overwrite bij->xsol by (- Lij bjj->xsol)
     void fwd_panel(int2 ij) {
         // Partial panel x[i] = - L[i,j] x[j]        
         int j = ij[1];
@@ -856,6 +860,7 @@ struct DistMat
         assert(bij->xsol.size() == Lij->cols());
     }
 
+    // + Reduce bij->xsol into bjj->xsol
     void bwd_reduction(int2 ij) {
         int j = ij[1];
         auto &bjj = blocs.at({j,j});
@@ -869,6 +874,8 @@ struct DistMat
         }
     }
 
+    // b is assumed to be the same on all nodes
+    // Returns the solution only on node 0
     VectorXd solve(VectorXd &b, int n_threads)
     {
         VectorXd xglob = perm.asPermutation() * b;
