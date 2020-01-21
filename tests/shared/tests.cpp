@@ -64,6 +64,16 @@ SpMat random_dag(int n, double p)
  * Unit tests
  */
 
+struct MyTask : Task {
+    vector<int>* ok_;
+    int k_;
+    MyTask(vector<int>* ok, int k) : ok_(ok), k_(k), Task("Task_" + std::to_string(k), 1.0) {};
+    virtual void run() {
+        (*ok_)[k_] = 1;
+    }
+    virtual void fulfill() {}
+};
+
 TEST(threadpool, tasksrun)
 {
     int n_threads = n_threads_;
@@ -73,10 +83,7 @@ TEST(threadpool, tasksrun)
 
     for (int k = 0; k < n_tasks; k++)
     {
-        Task *t = new Task();
-        t->run = [k, &ok]() { ok[k] = 1; };
-        t->fulfill = []() {};
-        t->name = "Task_" + to_string(k);
+        MyTask *t = new MyTask(&ok, k);
         tp.insert(t, k % n_threads);
     }
 

@@ -111,17 +111,19 @@ struct hash_int_N<array<T, N>>
     }
 };
 
-struct Task
+class Task
 {
-    function<void()> run;
-    function<void()> fulfill;
-    double priority;
+  public:
+    virtual void run() = 0;
+    virtual void fulfill() = 0;
     string name;
-    Task() : priority(0), name("_") {}
+    double priority;
+    Task(std::string&& name_, double prio) : name(std::forward<std::string>(name_)), priority(prio) {}
     const char *c_name()
     {
         return name.c_str();
     }
+    virtual ~Task() {};
 };
 
 struct less_pTask
@@ -758,6 +760,59 @@ private:
         tp->insert(t, where, binding);
     }
 
+    class ComputationalTask : public Task {
+      public:
+        K k;
+        Taskflow<K>* self;
+        virtual void run() {
+            self->f_run(k);
+        }
+        virtual void fulfill() {
+            self->f_fulfill(k);
+        }
+        ComputationalTask(K k_, Taskflow<K>* self_, std::string&& name, double prio) : k(k_), self(self_), Task(std::forward<std::string>(name), prio) {};
+    };
+
+    class DependencyTask : public Task {
+      public:
+        K k;
+        int where;
+        Taskflow<K>* self;
+        virtual void run() {
+            auto &dmk = self->dep_map[where];
+            auto search = dmk.find(k);
+            if (search == dmk.end())
+            { // k was not found in the map
+                // Insert it
+                assert(self->f_indegree(k) > 1);
+                auto insert_return = dmk.insert(make_pair(k, self->f_indegree(k)));
+                assert(insert_return.second); // (k,indegree) was successfully inserted
+
+                search = insert_return.first; // iterator for key k
+            }
+
+            const int count = --search->second; // decrement dependency counter
+
+            if (count < 0)
+            {
+                printf("Error: count < 0 for %s\n", self->name(k).c_str());
+                assert(false);
+            }
+
+            if (self->verb > 1)
+                printf("%s count: %d\n", self->name(k).c_str(), count);
+
+            if (count == 0)
+            {
+                // We erase the entry from the map
+                dmk.erase(k);
+                self->insert(k);
+            }
+        }
+        virtual void fulfill() {}
+        DependencyTask(K k_, int where_, Taskflow<K>* self_, std::string&& name, double prio) : k(k_), where(where_), self(self_), Task(std::forward<std::string>(name), prio) {}
+    };
+
 public:
     Taskflow(Threadpool_shared *tp_, int verb_ = 0) : tp(tp_), verb(verb_), dep_map(tp_->size())
     {
@@ -772,11 +827,7 @@ public:
 
     Task *make_task(K k, int &where, bool &binding)
     {
-        Task *t = new Task();
-        t->run = [this, k]() { f_run(k); };
-        t->fulfill = [this, k]() { f_fulfill(k); };
-        t->name = f_name(k);
-        t->priority = f_prio(k);
+        Task *t = new ComputationalTask(k, this, f_name(k), f_prio(k));
         where = f_mapping(k);
         binding = f_binding(k);
         return t;
@@ -850,43 +901,7 @@ public:
         assert(where >= 0 && where < static_cast<int>(dep_map.size()));
 
         // Create a task to access and modify the dependency map
-        Task *t = new Task();
-        t->fulfill = []() {};
-        t->name = "dep_map_intern_" + to_string(where);
-        t->priority = priority;
-
-        t->run = [this, where, k]() {
-            auto &dmk = this->dep_map[where];
-
-            auto search = dmk.find(k);
-            if (search == dmk.end())
-            { // k was not found in the map
-                // Insert it
-                assert(this->f_indegree(k) > 1);
-                auto insert_return = dmk.insert(make_pair(k, this->f_indegree(k)));
-                assert(insert_return.second); // (k,indegree) was successfully inserted
-
-                search = insert_return.first; // iterator for key k
-            }
-
-            const int count = --search->second; // decrement dependency counter
-
-            if (count < 0)
-            {
-                printf("Error: count < 0 for %s\n", name(k).c_str());
-                assert(false);
-            }
-
-            if (verb > 1)
-                printf("%s count: %d\n", name(k).c_str(), count);
-
-            if (count == 0)
-            {
-                // We erase the entry from the map
-                dmk.erase(k);
-                insert(k);
-            }
-        };
+        Task *t = new DependencyTask(k, where, this, "dep_map_intern_" + to_string(where), priority);
 
         tp->insert(t, where, true);
     }
